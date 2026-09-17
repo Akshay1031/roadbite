@@ -137,6 +137,7 @@ const state = {
   lastSearchPos: null,
   running: false,
   watchId: null,
+  wakeLock: null,      // Screen Wake Lock sentinel while driving
   placesLib: null,
   results: [],
   prevPos: null,
@@ -972,6 +973,35 @@ function maybeAlert() {
   }
 }
 
+// ---------- Screen wake lock ----------
+// Keep the screen awake while driving. The phone is mounted and glanced at, so the
+// normal sleep timeout would blank the app exactly when it's wanted. Best-effort:
+// where the API is missing (iOS before 16.4) the screen just times out as usual.
+async function acquireWakeLock() {
+  if (!('wakeLock' in navigator) || state.wakeLock || state.wakeLockPending) return;
+  state.wakeLockPending = true;
+  try {
+    const lock = await navigator.wakeLock.request('screen');
+    // Stopped while we were awaiting the request — don't hold a lock we no longer want.
+    if (!state.running) { lock.release().catch(() => {}); return; }
+    state.wakeLock = lock;
+    // The system drops the lock whenever the page is hidden; clear our handle so
+    // the visibilitychange listener in init() knows to request a fresh one.
+    lock.addEventListener('release', () => { state.wakeLock = null; });
+  } catch (_) {
+    state.wakeLock = null;   // denied, battery saver, or not permitted here
+  } finally {
+    state.wakeLockPending = false;
+  }
+}
+
+function releaseWakeLock() {
+  if (!state.wakeLock) return;
+  const lock = state.wakeLock;
+  state.wakeLock = null;
+  lock.release().catch(() => {});
+}
+
 // ---------- Position handling ----------
 function onPosition(coords) {
   const pos = { lat: coords.latitude, lng: coords.longitude };
@@ -1041,6 +1071,7 @@ function startTracking() {
   els.start.textContent = 'Stop';
   els.start.classList.add('running');
   setGps('on', 'Locating…');
+  acquireWakeLock();
   state.watchId = navigator.geolocation.watchPosition(
     p => onPosition(p.coords),
     err => setGps('error', err.code === 1 ? 'Location denied' : 'GPS error'),
@@ -1081,6 +1112,7 @@ function stop() {
   els.start.classList.remove('running');
   if (state.watchId != null) navigator.geolocation.clearWatch(state.watchId);
   if (state.simTimer) { clearInterval(state.simTimer); state.simTimer = null; }
+  releaseWakeLock();
   setGps('off', 'GPS off');
 }
 
@@ -1090,6 +1122,7 @@ function startSim() {
   state.running = true;
   els.start.textContent = 'Stop';
   els.start.classList.add('running');
+  acquireWakeLock();
   // Coarse Philly -> Lewiston ME waypoints (I-95 corridor).
   const route = [
     { lat: 39.9526, lng: -75.1652 }, // Philadelphia
@@ -1432,6 +1465,12 @@ function init() {
 
   if (!effectiveKey()) showEmpty('Welcome to Hino’s RoadBite\n\nTap ⚙︎ to add your Google Places API key, then "Start driving".', '🚗');
   else showEmpty('Tap "Start driving" to find food, coffee, gas & EV charging ahead of you.', '🍔☕');
+
+  // Returning to the app (unlock, tab switch back) — the system released any lock
+  // we held while hidden, so take a new one if we're still driving.
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && state.running) acquireWakeLock();
+  });
 
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
 }

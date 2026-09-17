@@ -29,6 +29,7 @@ It's a installable web app (PWA) — no App Store, works on iPhone and Android.
 - **Units toggle** (☰ menu): show distances in **miles or kilometers** (affects every distance, the steppers, and the route ETA).
 - **ETA + arrival time** in the header when a destination is set (driving time and clock arrival, from the Directions route).
 - **Share** button on each row — opens the phone's share sheet with the place name + a Maps link (copies the link as a fallback).
+- **Keeps the screen awake** while you're driving, so a dash-mounted phone doesn't blank out between glances. Released as soon as you tap Stop. (Needs iOS 16.4+ or Android Chrome; elsewhere the screen times out as usual.)
 - **Proximity buzz** (opt-in, ☰ menu): vibrates and shows a toast when a ≥4.5★ food/coffee spot is within 1 mile (Android supports the vibration).
 - **Destination prompt**: tapping Start driving without a destination asks where you're headed (one-tap Home/favorite chips, type-in, or "Skip — use my live heading") so you get the precise route-based forward-only filtering.
 - Filters food & coffee by **minimum rating** (default 4.0★) and **minimum review count** (default 50). Gas and EV are ranked by **proximity** instead (ratings there are sparse).
