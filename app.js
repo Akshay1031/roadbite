@@ -143,6 +143,9 @@ const state = {
   destCoords: null,     // {lat,lng} resolved destination
   destName: '',
   destResolvedFor: '',  // the query string destCoords was resolved from
+  searchGen: 0,         // bumps when a newer search starts, so stale results are dropped
+  skipped: null,        // place ids skipped for this trip (Set)
+  detourCache: null,    // place id -> added driving minutes
 };
 
 const settings = {
@@ -282,7 +285,7 @@ function updateMapMarkers() {
     position: pos, map: state.map, title, zIndex: z,
     icon: { path: google.maps.SymbolPath.CIRCLE, scale, fillColor: color, fillOpacity: 1, strokeColor: '#fff', strokeWeight: 2 },
   });
-  for (const r of state.results) {
+  for (const r of visibleResults()) {
     const m = pin(r.loc, KIND_COLORS[r.kind] || '#ff9500', 8, 1, r.name);
     m.addListener('click', () => highlightRow(r.id));   // pin -> row
     state.markers.push(m);
@@ -340,7 +343,7 @@ async function refreshRoute(fit) {
 }
 
 // Refresh the route/ETA when the destination changes, or every ~10 mi of travel.
-function maybeRefreshRoute() {
+async function maybeRefreshRoute() {
   if (!state.pos) return;
   const sig = state.destCoords
     ? `${state.destCoords.lat.toFixed(3)},${state.destCoords.lng.toFixed(3)}` : 'none';
@@ -349,7 +352,7 @@ function maybeRefreshRoute() {
   if (newDest || movedFar) {
     state.routeSig = sig;
     state.routeOrigin = state.pos;
-    refreshRoute(newDest);   // only re-fit the map viewport for a brand-new destination
+    await refreshRoute(newDest);   // only re-fit the map viewport for a brand-new destination
   }
 }
 
@@ -382,8 +385,94 @@ async function refreshMap() {
 }
 
 // ---------- Search ----------
+// How many sample points to search along a long route. Each one is a small circle
+// so a bend in the road is covered, without one giant circle whose 20-result quota
+// fills up with the closest mediocre places.
+const MAX_CORRIDOR_STOPS = 6;
+// Added driving minutes weigh this much against the rating term ((5 - stars) * 4).
+// Eight extra minutes ≈ one star.
+const DETOUR_MINUTE_WEIGHT = 0.5;
+const DETOUR_REFINE_COUNT = 6;
+
+// Circles to search. With a driving route, samples follow the road. Without one,
+// this is the single circle the app used before (around you, or around a point
+// N minutes ahead).
+function planSearchCenters() {
+  const haveRoute = !!(state.routePath && state.routeCum && state.userAlong != null);
+  if (settings.timeWindow > 0) {
+    const targetMi = speedEstimate() * settings.timeWindow / 60;
+    if (haveRoute) {
+      const band = clamp(targetMi * 0.45, 6, 12);
+      state.aheadLimitMiles = targetMi + band * 2;
+      const spots = [-band, band].map(offset => ({
+        center: pointAlongPath(state.routePath, state.routeCum, state.userAlong + targetMi + offset),
+        radiusMi: band,
+      }));
+      return dedupeCenters(spots);
+    }
+    let center = { lat: state.pos.lat, lng: state.pos.lng };
+    if (effectiveHeading() != null) center = destPoint(state.pos, effectiveHeading(), targetMi);
+    const radiusMi = clamp(targetMi * 0.6, 6, 31);
+    state.aheadLimitMiles = targetMi + radiusMi;
+    return [{ center, radiusMi }];
+  }
+
+  state.aheadLimitMiles = settings.lookAhead;
+  if (haveRoute) return corridorStops(state.userAlong, state.userAlong + settings.lookAhead);
+  return [{ center: { lat: state.pos.lat, lng: state.pos.lng }, radiusMi: Math.min(settings.lookAhead, 31) }];
+}
+
+// Sample the route from `fromAlong` to `toAlong` (miles from the route start).
+function corridorStops(fromAlong, toAlong) {
+  const total = state.routeCum[state.routeCum.length - 1];
+  const start = clamp(fromAlong, 0, total);
+  const end = clamp(toAlong, start, total);
+  const span = end - start;
+  if (span <= 14) {
+    const radiusMi = clamp(Math.max(span * 0.7, 6), 6, 16);
+    return [{ center: pointAlongPath(state.routePath, state.routeCum, start + span / 2), radiusMi }];
+  }
+  let n = clamp(Math.ceil(span / 22), 2, MAX_CORRIDOR_STOPS);
+  let step = span / n;
+  let radiusMi = clamp(step * 0.62, 8, 16);
+  while (step - radiusMi * 2 > 3 && n < MAX_CORRIDOR_STOPS) {
+    n += 1;
+    step = span / n;
+    radiusMi = clamp(step * 0.62, 8, 16);
+  }
+  const centers = [];
+  for (let i = 0; i < n; i++) {
+    centers.push({
+      center: pointAlongPath(state.routePath, state.routeCum, start + step * (i + 0.5)),
+      radiusMi,
+    });
+  }
+  return centers;
+}
+
+function dedupeCenters(spots) {
+  const out = [];
+  for (const s of spots) {
+    if (out.some(o => haversineMi(o.center, s.center) < 2)) continue;
+    out.push(s);
+  }
+  return out.length ? out : spots.slice(0, 1);
+}
+
+// Minutes a via-place route adds over staying on the highway for `highwayMi`.
+function addedDetourMinutes(viaSec, highwayMi, mph) {
+  const highwaySec = (Math.max(0, highwayMi) / Math.max(mph, 1)) * 3600;
+  return Math.max(0, Math.round((viaSec - highwaySec) / 60));
+}
+
+function preferredRank(cat, Rank) {
+  if ((cat === 'food' || cat === 'coffee') && Rank.POPULARITY) return Rank.POPULARITY;
+  return Rank.DISTANCE;
+}
+
 async function search() {
   if (!state.pos) return;
+  const gen = ++state.searchGen;
   let lib;
   try {
     lib = await ensurePlaces();
@@ -395,6 +484,10 @@ async function search() {
   const { Place, SearchNearbyRankPreference } = lib;
 
   await resolveDestination(lib);
+  if (gen !== state.searchGen) return;
+  // The corridor follows the driving route, so fetch it before choosing circles.
+  if (state.destCoords) await maybeRefreshRoute();
+  if (gen !== state.searchGen) return;
 
   const cats = settings.categories;
   if (!cats.length) { showEmpty('Pick at least one category above (Food, Coffee, Gas, EV).', '🧭'); return; }
@@ -403,52 +496,48 @@ async function search() {
   state.userAlong = (state.routePath && state.routeCum)
     ? projectToPath(state.pos, state.routePath, state.routeCum).along : null;
 
-  // Where to search. Normally around us. But with a "reach in N min" window we look
-  // AROUND the point ~N minutes ahead on the route — Google's radius (≤31mi) can't
-  // otherwise reach far enough, which is why it used to only show nearby places.
-  let center = { lat: state.pos.lat, lng: state.pos.lng };
-  let radiusMi = Math.min(settings.lookAhead, 31);
-  state.aheadLimitMiles = settings.lookAhead;
-
-  if (settings.timeWindow > 0) {
-    const targetMi = speedEstimate() * settings.timeWindow / 60;   // miles you'll cover in N min
-    if (state.routePath && state.routeCum && state.userAlong != null) {
-      center = pointAlongPath(state.routePath, state.routeCum, state.userAlong + targetMi);
-    } else if (effectiveHeading() != null) {
-      center = destPoint(state.pos, effectiveHeading(), targetMi);
-    }
-    radiusMi = clamp(targetMi * 0.6, 6, 31);     // a band around the future point
-    state.aheadLimitMiles = targetMi + radiusMi; // let rankPlace keep these far-ahead stops
-  }
-  const radiusMeters = radiusMi * 1609.34;
+  const centers = planSearchCenters();
   const fields = ['displayName', 'location', 'rating', 'userRatingCount',
                   'businessStatus', 'regularOpeningHours', 'primaryType',
                   'primaryTypeDisplayName', 'addressComponents', 'id'];
 
-  // One search per selected category so each is well represented in the results.
-  // If a request fails (e.g. an optional "atmosphere" field isn't accepted), retry
-  // once WITHOUT the optional fields so a single bad field can't wipe out results.
+  // One search per category per circle so each category is represented.
+  // Food and coffee ask for popularity inside the circle; a distance ranking
+  // lets the 20 closest spots crowd out a better one a little further along.
+  // A failed optional field (fuel price, charger info) is retried once without it.
   let searchErr = null;
-  state.disabledFields = state.disabledFields || new Set();   // optional fields that errored this session
-  const tasks = cats.map(cat => {
+  state.disabledFields = state.disabledFields || new Set();
+  const tasks = [];
+  for (const cat of cats) {
     const includedTypes = (cat === 'food' && settings.cuisines.length)
       ? settings.cuisines.slice()
       : CATEGORY_TYPES[cat];
     const extra = [];
-    if (cat === 'gas') extra.push('fuelOptions');             // fuel prices
-    if (cat === 'ev') extra.push('evChargeOptions');          // charger speed/plugs
+    if (cat === 'gas') extra.push('fuelOptions');
+    if (cat === 'ev') extra.push('evChargeOptions');
     const useExtra = extra.filter(f => !state.disabledFields.has(f));
-    const run = flds => Place.searchNearby({
-      fields: flds, locationRestriction: { center, radius: radiusMeters }, includedTypes,
-      maxResultCount: 20, rankPreference: SearchNearbyRankPreference.DISTANCE,
-    }).then(r => r.places || []);
-    return run(fields.concat(useExtra)).catch(err => {
-      searchErr = err;
-      useExtra.forEach(f => state.disabledFields.add(f));     // don't retry these this session
-      console.warn('searchNearby failed for', cat, '— retrying without optional fields:', err && err.message);
-      return run(fields).catch(e2 => { searchErr = e2; return []; });
-    });
-  });
+    const rank = preferredRank(cat, SearchNearbyRankPreference);
+    for (const spot of centers) {
+      const radiusMeters = Math.min(spot.radiusMi * 1609.34, 50000);
+      const run = (flds, pref) => Place.searchNearby({
+        fields: flds,
+        locationRestriction: { center: spot.center, radius: radiusMeters },
+        includedTypes,
+        maxResultCount: 20,
+        rankPreference: pref,
+      }).then(r => r.places || []);
+      const runRanked = flds => run(flds, rank).catch(err => {
+        if (rank === SearchNearbyRankPreference.DISTANCE) throw err;
+        return run(flds, SearchNearbyRankPreference.DISTANCE);
+      });
+      tasks.push(runRanked(fields.concat(useExtra)).catch(err => {
+        searchErr = err;
+        useExtra.forEach(f => state.disabledFields.add(f));
+        console.warn('searchNearby failed for', cat, '— retrying without optional fields:', err && err.message);
+        return runRanked(fields).catch(e2 => { searchErr = e2; return []; });
+      }));
+    }
+  }
 
   let groups;
   try {
@@ -457,11 +546,12 @@ async function search() {
     showEmpty('Search failed: ' + e.message, '⚠️');
     return;
   }
+  if (gen !== state.searchGen) return;
 
-  // Merge + de-dupe across categories.
+  // Merge + de-dupe across categories and corridor circles.
   const seen = new Set(), merged = [];
   for (const g of groups) for (const p of g) {
-    if (!seen.has(p.id)) { seen.add(p.id); merged.push(p); }
+    if (p && p.id && !seen.has(p.id)) { seen.add(p.id); merged.push(p); }
   }
 
   state.results = sortResults(merged.map(rankPlace).filter(Boolean)).slice(0, 40);
@@ -469,18 +559,77 @@ async function search() {
   // Be explicit about WHY the list is empty instead of silently showing nothing.
   if (!state.results.length) {
     if (state.map) updateMapMarkers();
-    maybeRefreshRoute();
     if (!merged.length && searchErr) {
       showEmpty('Google Places error: ' + (searchErr.message || searchErr) +
                 '\nTap ⚙︎ to check your key, or try again.', '⚠️');
     } else if (merged.length) {
-      showEmpty('Found places nearby, but your filters hid them all.\nIn ⚙︎ try a lower Minimum rating, turn off “Prefer quick stops,” or raise Max detour.', '🔧');
+      showEmpty('Found places nearby, but your filters hid them all.\nIn ⚙︎ try a lower Minimum rating or raise Max detour.', '🔧');
     } else {
       showEmpty('No matching spots ahead yet. Loosen filters in ⚙︎ or keep driving.');
     }
     return;
   }
   render();
+  refineDetourMinutes(state.results, gen);
+}
+
+// Ask Directions how many minutes the top stops add, then re-rank on that.
+// The list paints first with the straight-line estimate so a slow route call
+// doesn't leave the screen blank.
+async function refineDetourMinutes(list, gen) {
+  if (!state.routePath || !state.routeCum || !list.length) return;
+  let routesLib;
+  try { routesLib = await google.maps.importLibrary('routes'); }
+  catch (_) { return; }
+  if (gen !== state.searchGen) return;
+  const svc = new routesLib.DirectionsService();
+  state.detourCache = state.detourCache || new Map();
+  const top = list.filter(r => !state.skipped || !state.skipped.has(r.id)).slice(0, DETOUR_REFINE_COUNT);
+  await Promise.all(top.map(async r => {
+    if (state.detourCache.has(r.id)) {
+      applyDetourMinutes(r, state.detourCache.get(r.id));
+      return;
+    }
+    try {
+      const minutes = await drivingDetourMinutes(svc, r);
+      if (minutes == null || gen !== state.searchGen) return;
+      state.detourCache.set(r.id, minutes);
+      applyDetourMinutes(r, minutes);
+    } catch (_) { /* keep the straight-line estimate for this stop */ }
+  }));
+  if (gen !== state.searchGen) return;
+  state.results = sortResults(list);
+  render();
+}
+
+// Out-and-back driving time: exit the route, stop at the place, rejoin just ahead.
+async function drivingDetourMinutes(svc, r) {
+  const proj = projectToPath(r.loc, state.routePath, state.routeCum);
+  if (proj.perp < 0.05) return 0;
+  const total = state.routeCum[state.routeCum.length - 1];
+  let exitAlong = proj.along;
+  let rejoinAlong = Math.min(proj.along + 0.5, total);
+  if (rejoinAlong - exitAlong < 0.15) {
+    rejoinAlong = total;
+    exitAlong = Math.max(0, total - 0.5);
+  }
+  const exit = pointAlongPath(state.routePath, state.routeCum, exitAlong);
+  const rejoin = pointAlongPath(state.routePath, state.routeCum, rejoinAlong);
+  const res = await svc.route({
+    origin: exit,
+    destination: rejoin,
+    waypoints: [{ location: r.loc, stopover: true }],
+    travelMode: google.maps.TravelMode.DRIVING,
+  });
+  const viaSec = (res.routes?.[0]?.legs || []).reduce((sum, leg) => sum + (leg.duration?.value || 0), 0);
+  if (!viaSec) return null;
+  return addedDetourMinutes(viaSec, rejoinAlong - exitAlong, speedEstimate());
+}
+
+function applyDetourMinutes(r, minutes) {
+  r.detourMin = minutes;
+  if (r.ratingPenalty == null || r.distPenalty == null) return;
+  r.score = r.ratingPenalty + r.distPenalty + minutes * DETOUR_MINUTE_WEIGHT;
 }
 
 // Apply the active sort. Default "best" = combined score (rating + detour + distance).
@@ -529,6 +678,7 @@ function setDestStatus(text) {
 async function setDestination(value) {
   settings.destination = value || '';
   state.destResolvedFor = '';
+  clearTrip();
   const di = $('#dest'); if (di) di.value = settings.destination;
   saveSettings();
   renderQuickDest();
@@ -647,10 +797,11 @@ function rankPlace(p) {
   if (settings.timeWindow && etaMin > settings.timeWindow + 5) return null;
 
   // Score: lower is better. Reward rating (food/coffee), penalize detour & distance.
+  // Until Directions returns, detour is the straight-line estimate (off the road and back).
   const ratingPenalty = ratedKind ? (5 - rating) * 4 : 6;
-  const detourPenalty = (detour ?? straight) * 3;
   const distPenalty = Math.max(0, along) * 0.4;
-  const score = ratingPenalty + detourPenalty + distPenalty;
+  const detourPenalty = (detour ?? straight) * 3;
+  const score = ratingPenalty + distPenalty + detourPenalty;
 
   let openNow = null;
   try { openNow = p.regularOpeningHours?.isOpen?.() ?? null; } catch (_) {}
@@ -663,6 +814,7 @@ function rankPlace(p) {
   return {
     id: p.id, name: p.displayName, loc, rating, reviews, kind,
     isCoffee: kind === 'coffee', along, detour, straight, etaMin, openNow, score,
+    ratingPenalty, distPenalty,
     city: extractCity(p.addressComponents),
     typeLabel: humanizeType(p, kind),
     fuelPrice: fuel ? fuel.label : '',
@@ -758,16 +910,42 @@ function fmtCount(n) {
   return String(n);
 }
 
+function tripSkips() {
+  if (!state.skipped) state.skipped = new Set();
+  return state.skipped;
+}
+
+function visibleResults() {
+  const skip = tripSkips();
+  return state.results.filter(r => !skip.has(r.id));
+}
+
+// "+6 min" once Directions has answered, otherwise the straight-line estimate.
+function detourPhrase(r) {
+  if (r.detourMin != null) return `+${r.detourMin} min`;
+  if (r.detour != null) return `+${fmtMi(r.detour)} off route`;
+  return '';
+}
+
 function render() {
   els.results.innerHTML = '';
+  const list = visibleResults();
   if (!state.results.length) {
+    hideNextCard();
     showEmpty('No matching spots ahead yet. Loosen filters in ⚙︎ or keep driving.');
+    return;
+  }
+  if (!list.length) {
+    hideNextCard();
+    if (state.map) updateMapMarkers();
+    showEmpty('Those stops are skipped for this trip.\nKeep driving and new ones will show up.');
     return;
   }
   els.empty.classList.add('hidden');
   $('#controls').classList.remove('hidden');
+  renderNextCard(list[0]);
 
-  for (const r of state.results) {
+  for (const r of list) {
     const li = document.createElement('li');
     li.className = 'row ' + r.kind;
 
@@ -781,8 +959,9 @@ function render() {
       r.city && escapeHtml(r.city),
     ].filter(Boolean).join('<span class="mid">·</span>');
 
-    // line 3: price/charge info · open status · detour off route
-    const detourTxt = r.detour != null ? `<span class="detour">+${fmtMi(r.detour)} off route</span>` : '';
+    // line 3: price/charge info · open status · minutes added (or the mile estimate)
+    const phrase = detourPhrase(r);
+    const detourTxt = phrase ? `<span class="detour">${escapeHtml(phrase)}</span>` : '';
     const openTxt = r.openNow == null ? ''
       : `<span class="open ${r.openNow ? '' : 'closed'}">${r.openNow ? 'Open' : 'Closed'}</span>`;
     const priceTxt = r.fuelPrice ? `<span class="price">${escapeHtml(r.fuelPrice)}</span>` : '';
@@ -817,8 +996,59 @@ function render() {
   maybeAlert();
 }
 
+function hideNextCard() {
+  const el = document.getElementById('next-card');
+  if (el) { el.classList.add('hidden'); el.innerHTML = ''; }
+}
+
+// The passenger card: one next stop, the minutes it adds, Go, and Skip.
+function renderNextCard(r) {
+  let el = document.getElementById('next-card');
+  if (!el) {
+    el = document.createElement('section');
+    el.id = 'next-card';
+    el.className = 'next-card';
+    el.setAttribute('aria-live', 'polite');
+    els.results.parentNode.insertBefore(el, els.results);
+  }
+  el.classList.remove('hidden');
+  const meta = [
+    r.rating > 0 ? `<span class="stars">★ ${r.rating.toFixed(1)}</span> <span class="count">(${fmtCount(r.reviews)})</span>` : '',
+    r.typeLabel ? escapeHtml(r.typeLabel) : '',
+    r.city ? escapeHtml(r.city) : '',
+  ].filter(Boolean).join('<span class="mid">·</span>');
+  const phrase = detourPhrase(r);
+  const addedNote = r.detourMin != null ? 'added to your route' : (r.detour != null ? 'off route, estimated' : '');
+  const when = r.etaMin != null ? ` · ~${r.etaMin} min away` : '';
+  el.innerHTML = `
+    <div class="next-kicker">Next stop${when}</div>
+    <h2 class="next-name">${escapeHtml(r.name)}</h2>
+    <div class="next-meta">${meta}</div>
+    ${phrase ? `<div class="next-added">${escapeHtml(phrase)}${addedNote ? `<span>${escapeHtml(addedNote)}</span>` : ''}</div>` : ''}
+    <div class="next-actions">
+      <button type="button" class="next-go" id="next-go">Go</button>
+      <button type="button" class="next-skip" id="next-skip">Skip</button>
+    </div>`;
+  el.querySelector('.next-name').addEventListener('click', () => openDetail(r));
+  el.querySelector('#next-go').addEventListener('click', () => navigateTo(r));
+  el.querySelector('#next-skip').addEventListener('click', () => skipStop(r.id));
+}
+
+function skipStop(id) {
+  tripSkips().add(id);
+  render();
+  const next = visibleResults()[0];
+  if (next && next.detourMin == null) refineDetourMinutes(state.results, state.searchGen);
+}
+
+function clearTrip() {
+  if (state.skipped) state.skipped.clear();
+  if (state.detourCache) state.detourCache.clear();
+}
+
 function showEmpty(msg, emoji) {
   els.results.innerHTML = '';
+  hideNextCard();
   els.empty.innerHTML = (emoji ? `<span class="big">${emoji}</span>` : '') + escapeHtml(msg);
   els.empty.classList.remove('hidden');
   // Keep the controls (Reach in / sort / open-now) usable once we're driving, so you
@@ -964,7 +1194,7 @@ function toast(msg) {
 function maybeAlert() {
   if (!settings.alertNearby || !state.running) return;
   state.alerted = state.alerted || new Set();
-  for (const r of state.results) {
+  for (const r of visibleResults()) {
     if ((r.kind === 'food' || r.kind === 'coffee') && r.rating >= 4.5 &&
         r.straight <= 1.0 && !state.alerted.has(r.id)) {
       state.alerted.add(r.id);
@@ -1080,6 +1310,8 @@ async function promptGo(value) {
 
 function stop() {
   state.running = false;
+  clearTrip();
+  if (state.results.length) render();
   els.start.textContent = 'Start driving';
   els.start.classList.remove('running');
   if (state.watchId != null) navigator.geolocation.clearWatch(state.watchId);
@@ -1443,4 +1675,8 @@ function init() {
 document.addEventListener('DOMContentLoaded', init);
 
 // Expose a few internals for testing in the preview harness.
-window.RoadBite = { state, settings, onPosition, search, startSim, render, renderQuickDest, sortResults, updateHeadingBanner, toast, rankPlace };
+window.RoadBite = {
+  state, settings, onPosition, search, startSim, render, renderQuickDest, sortResults,
+  updateHeadingBanner, toast, rankPlace, planSearchCenters, corridorStops, addedDetourMinutes,
+  applyDetourMinutes, visibleResults, skipStop, detourPhrase,
+};
