@@ -137,6 +137,7 @@ const state = {
   lastSearchPos: null,
   running: false,
   watchId: null,
+  wakeLock: null,       // Screen Wake Lock Sentinel
   placesLib: null,
   results: [],
   prevPos: null,
@@ -146,6 +147,7 @@ const state = {
   searchGen: 0,         // bumps when a newer search starts, so stale results are dropped
   skipped: null,        // place ids skipped for this trip (Set)
   detourCache: null,    // place id -> added driving minutes
+  placesCache: null,    // spatial cache: key -> { places, timestamp }
 };
 
 const settings = {
@@ -159,6 +161,7 @@ const settings = {
   openNowOnly: false,
   timeWindow: 0,        // minutes; 0 = any, else only show stops reachable within N min
   units: 'mi',          // 'mi' | 'km'
+  navApp: 'auto',       // 'auto' | 'apple' | 'google' | 'waze'
   showMap: true,
   alertNearby: false,   // buzz when a top pick is coming up
   starbucksOnly: false,
@@ -174,11 +177,79 @@ function loadSettings() {
   try {
     const s = JSON.parse(localStorage.getItem('roadbite') || '{}');
     Object.assign(settings, s);
+    if (!['auto', 'apple', 'google', 'waze'].includes(settings.navApp)) {
+      settings.navApp = 'auto';
+    }
   } catch (_) {}
   settings.timeWindow = 0;   // "Reach in" always starts at Any each time the app opens
 }
 function saveSettings() {
   localStorage.setItem('roadbite', JSON.stringify(settings));
+}
+
+// ---------- Screen Wake Lock API ----------
+async function acquireWakeLock() {
+  if (!('wakeLock' in navigator) || state.wakeLock) return;
+  try {
+    const lock = await navigator.wakeLock.request('screen');
+    if (!state.running) { lock.release().catch(() => {}); return; }
+    state.wakeLock = lock;
+    state.wakeLock.addEventListener('release', () => {
+      state.wakeLock = null;
+    });
+  } catch (_) {
+    state.wakeLock = null;
+  }
+}
+
+async function releaseWakeLock() {
+  if (state.wakeLock) {
+    try {
+      await state.wakeLock.release();
+    } catch (_) {}
+    state.wakeLock = null;
+  }
+}
+
+// ---------- Spatial Places Cache ----------
+const PLACES_CACHE_TTL = 25 * 60 * 1000;   // 25 minutes
+const PLACES_CACHE_MAX = 150;
+
+function getCachedPlaces(key) {
+  if (!state.placesCache) return null;
+  const entry = state.placesCache.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.timestamp > PLACES_CACHE_TTL) {
+    state.placesCache.delete(key);
+    return null;
+  }
+  return entry.places;
+}
+
+function setCachedPlaces(key, places) {
+  state.placesCache = state.placesCache || new Map();
+  if (state.placesCache.size >= PLACES_CACHE_MAX) {
+    expirePlacesCache();
+  }
+  state.placesCache.set(key, { places, timestamp: Date.now() });
+}
+
+function expirePlacesCache() {
+  if (!state.placesCache) return;
+  const now = Date.now();
+  for (const [k, v] of state.placesCache.entries()) {
+    if (now - v.timestamp > PLACES_CACHE_TTL) {
+      state.placesCache.delete(k);
+    }
+  }
+  if (state.placesCache.size >= PLACES_CACHE_MAX) {
+    const drop = Array.from(state.placesCache.keys()).slice(0, 30);
+    for (const k of drop) state.placesCache.delete(k);
+  }
+}
+
+function clearPlacesCache() {
+  if (state.placesCache) state.placesCache.clear();
 }
 
 // ---------- DOM ----------
@@ -400,21 +471,21 @@ const DETOUR_REFINE_COUNT = 6;
 function planSearchCenters() {
   const haveRoute = !!(state.routePath && state.routeCum && state.userAlong != null);
   if (settings.timeWindow > 0) {
+    // Same meaning for 15 min, 30 min, 1 hr, 2 hr, 3 hr: stops reachable within about
+    // N minutes, including ones a few minutes away. Search from here through the
+    // window (not only around the far point).
     const targetMi = speedEstimate() * settings.timeWindow / 60;
+    const slackMi = speedEstimate() * 5 / 60;   // matches rankPlace's +5 min slack
+    state.aheadLimitMiles = targetMi + slackMi;
+    const here = { lat: state.pos.lat, lng: state.pos.lng };
     if (haveRoute) {
-      const band = clamp(targetMi * 0.45, 6, 12);
-      state.aheadLimitMiles = targetMi + band * 2;
-      const spots = [-band, band].map(offset => ({
-        center: pointAlongPath(state.routePath, state.routeCum, state.userAlong + targetMi + offset),
-        radiusMi: band,
-      }));
-      return dedupeCenters(spots);
+      const along = corridorStops(state.userAlong, state.userAlong + targetMi + slackMi);
+      // Explicit near-car circle so short-ETA stops aren't missed on long windows.
+      const nearR = clamp(Math.min(targetMi + slackMi, 12), 6, 12);
+      return dedupeCenters([{ center: here, radiusMi: nearR }, ...along]);
     }
-    let center = { lat: state.pos.lat, lng: state.pos.lng };
-    if (effectiveHeading() != null) center = destPoint(state.pos, effectiveHeading(), targetMi);
-    const radiusMi = clamp(targetMi * 0.6, 6, 31);
-    state.aheadLimitMiles = targetMi + radiusMi;
-    return [{ center, radiusMi }];
+    const radiusMi = clamp(targetMi + slackMi, 6, 31);
+    return [{ center: here, radiusMi }];
   }
 
   state.aheadLimitMiles = settings.lookAhead;
@@ -477,8 +548,15 @@ async function search() {
   try {
     lib = await ensurePlaces();
   } catch (e) {
-    if (e.message === 'NO_KEY') showEmpty('Add your Google Places API key in ⚙︎ Settings to see suggestions.');
-    else showEmpty('Google Places error: ' + e.message);
+    if (e.message === 'NO_KEY') {
+      showEmpty('Add your Google Places API key in ⚙︎ Settings to see suggestions.');
+      return;
+    }
+    if (state.results && state.results.length > 0) {
+      toast('Offline · showing previous stops');
+      return;
+    }
+    showEmpty('Google Places error: ' + e.message);
     return;
   }
   const { Place, SearchNearbyRankPreference } = lib;
@@ -518,6 +596,12 @@ async function search() {
     const useExtra = extra.filter(f => !state.disabledFields.has(f));
     const rank = preferredRank(cat, SearchNearbyRankPreference);
     for (const spot of centers) {
+      const cacheKey = `${cat}:${Math.round(spot.center.lat * 25) / 25}:${Math.round(spot.center.lng * 25) / 25}:${Math.round(spot.radiusMi)}`;
+      const cached = getCachedPlaces(cacheKey);
+      if (cached) {
+        tasks.push(Promise.resolve(cached));
+        continue;
+      }
       const radiusMeters = Math.min(spot.radiusMi * 1609.34, 50000);
       const run = (flds, pref) => Place.searchNearby({
         fields: flds,
@@ -531,10 +615,15 @@ async function search() {
         return run(flds, SearchNearbyRankPreference.DISTANCE);
       });
       tasks.push(runRanked(fields.concat(useExtra)).catch(err => {
-        searchErr = err;
         useExtra.forEach(f => state.disabledFields.add(f));
         console.warn('searchNearby failed for', cat, '— retrying without optional fields:', err && err.message);
-        return runRanked(fields).catch(e2 => { searchErr = e2; return []; });
+        return runRanked(fields).catch(e2 => { searchErr = e2 || err; return null; });
+      }).then(places => {
+        if (Array.isArray(places)) {
+          setCachedPlaces(cacheKey, places);
+          return places;
+        }
+        return [];
       }));
     }
   }
@@ -543,6 +632,10 @@ async function search() {
   try {
     groups = await Promise.all(tasks);
   } catch (e) {
+    if (state.results && state.results.length > 0) {
+      toast('Offline · showing previous stops');
+      return;
+    }
     showEmpty('Search failed: ' + e.message, '⚠️');
     return;
   }
@@ -554,10 +647,27 @@ async function search() {
     if (p && p.id && !seen.has(p.id)) { seen.add(p.id); merged.push(p); }
   }
 
-  state.results = sortResults(merged.map(rankPlace).filter(Boolean)).slice(0, 40);
+  // If search tasks failed with an error and yielded no results:
+  if (!merged.length && searchErr) {
+    if (state.results && state.results.length > 0) {
+      toast('Offline · showing previous stops');
+      return;
+    }
+    if (state.map) updateMapMarkers();
+    showEmpty('Google Places error: ' + (searchErr.message || searchErr) +
+              '\nTap ⚙︎ to check your key, or try again.', '⚠️');
+    return;
+  }
+
+  const ranked = sortResults(merged.map(rankPlace).filter(Boolean)).slice(0, 40);
 
   // Be explicit about WHY the list is empty instead of silently showing nothing.
-  if (!state.results.length) {
+  if (!ranked.length) {
+    if (searchErr && state.results && state.results.length > 0) {
+      toast('Offline · showing previous stops');
+      return;
+    }
+    state.results = [];
     if (state.map) updateMapMarkers();
     if (!merged.length && searchErr) {
       showEmpty('Google Places error: ' + (searchErr.message || searchErr) +
@@ -569,13 +679,14 @@ async function search() {
     }
     return;
   }
+  state.results = ranked;
   render();
   refineDetourMinutes(state.results, gen);
 }
 
 // Ask Directions how many minutes the top stops add, then re-rank on that.
 // The list paints first with the straight-line estimate so a slow route call
-// doesn't leave the screen blank.
+// doesn't leave the screen blank. Staggered with a 120ms delay to avoid OVER_QUERY_LIMIT.
 async function refineDetourMinutes(list, gen) {
   if (!state.routePath || !state.routeCum || !list.length) return;
   let routesLib;
@@ -585,18 +696,30 @@ async function refineDetourMinutes(list, gen) {
   const svc = new routesLib.DirectionsService();
   state.detourCache = state.detourCache || new Map();
   const top = list.filter(r => !state.skipped || !state.skipped.has(r.id)).slice(0, DETOUR_REFINE_COUNT);
-  await Promise.all(top.map(async r => {
+  for (let i = 0; i < top.length; i++) {
+    if (gen !== state.searchGen) return;
+    const r = top[i];
     if (state.detourCache.has(r.id)) {
-      applyDetourMinutes(r, state.detourCache.get(r.id));
-      return;
+      const cached = state.detourCache.get(r.id);
+      if (cached != null) applyDetourMinutes(r, cached);
+      continue;
     }
     try {
       const minutes = await drivingDetourMinutes(svc, r);
-      if (minutes == null || gen !== state.searchGen) return;
-      state.detourCache.set(r.id, minutes);
-      applyDetourMinutes(r, minutes);
-    } catch (_) { /* keep the straight-line estimate for this stop */ }
-  }));
+      if (gen === state.searchGen) {
+        state.detourCache.set(r.id, minutes);
+        if (minutes != null) applyDetourMinutes(r, minutes);
+      }
+    } catch (_) {
+      if (gen === state.searchGen) {
+        state.detourCache.set(r.id, null);
+      }
+    }
+    if (gen !== state.searchGen) return;
+    if (i < top.length - 1) {
+      await new Promise(res => setTimeout(res, 120));
+    }
+  }
   if (gen !== state.searchGen) return;
   state.results = sortResults(list);
   render();
@@ -627,6 +750,7 @@ async function drivingDetourMinutes(svc, r) {
 }
 
 function applyDetourMinutes(r, minutes) {
+  if (minutes == null) return;
   r.detourMin = minutes;
   if (r.ratingPenalty == null || r.distPenalty == null) return;
   r.score = r.ratingPenalty + r.distPenalty + minutes * DETOUR_MINUTE_WEIGHT;
@@ -1057,15 +1181,24 @@ function showEmpty(msg, emoji) {
 }
 
 function escapeHtml(s) {
-  return s.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  if (s == null) return '';
+  return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
 function navigateTo(r) {
-  const isApple = /iPhone|iPad|Macintosh/.test(navigator.userAgent);
-  const q = `${r.loc.lat},${r.loc.lng}`;
-  const url = isApple
-    ? `https://maps.apple.com/?daddr=${q}&dirflg=d`
-    : `https://www.google.com/maps/dir/?api=1&destination=${q}&travelmode=driving`;
+  let app = settings.navApp || 'auto';
+  if (app === 'auto') {
+    const isApple = /iPhone|iPad|Macintosh/.test(navigator.userAgent);
+    app = isApple ? 'apple' : 'google';
+  }
+  let url;
+  if (app === 'apple') {
+    url = `https://maps.apple.com/?daddr=${r.loc.lat},${r.loc.lng}&q=${encodeURIComponent(r.name)}&dirflg=d`;
+  } else if (app === 'waze') {
+    url = `https://waze.com/ul?ll=${r.loc.lat},${r.loc.lng}&navigate=yes`;
+  } else {
+    url = `https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(r.name)}&destination_place_id=${encodeURIComponent(r.id)}&travelmode=driving`;
+  }
   window.open(url, '_blank');
 }
 
@@ -1147,7 +1280,10 @@ async function fillDetail(r) {
   if (call && place.nationalPhoneNumber) { call.href = 'tel:' + place.nationalPhoneNumber.replace(/[^0-9+]/g, ''); call.hidden = false; }
 
   const web = document.getElementById('d-web');
-  if (web && place.websiteURI) { web.href = place.websiteURI; web.hidden = false; }
+  if (web && place.websiteURI && /^https?:\/\//i.test(place.websiteURI)) {
+    web.href = place.websiteURI;
+    web.hidden = false;
+  }
 
   const hours = place.regularOpeningHours?.weekdayDescriptions;
   if (hours && hours.length) {
@@ -1271,6 +1407,7 @@ function startTracking() {
   if (state.running) return;
   if (!('geolocation' in navigator)) { setGps('error', 'No GPS'); return; }
   state.running = true;
+  acquireWakeLock();
   els.start.textContent = 'Stop';
   els.start.classList.add('running');
   setGps('on', 'Locating…');
@@ -1310,6 +1447,7 @@ async function promptGo(value) {
 
 function stop() {
   state.running = false;
+  releaseWakeLock();
   clearTrip();
   if (state.results.length) render();
   els.start.textContent = 'Start driving';
@@ -1323,6 +1461,7 @@ function stop() {
 function startSim() {
   stop();
   state.running = true;
+  acquireWakeLock();
   els.start.textContent = 'Stop';
   els.start.classList.add('running');
   // Coarse Philly -> Lewiston ME waypoints (I-95 corridor).
@@ -1339,19 +1478,23 @@ function startSim() {
     { lat: 43.6591, lng: -70.2568 }, // Portland ME
     { lat: 44.1004, lng: -70.2148 }, // Lewiston ME
   ];
+  // Desk-test pace: ~0.9 mi every 10s. Search only runs after you move >1 mi, so the
+  // list refreshes about every other tick (~20s) instead of thrashing every few seconds.
   let i = 0, f = 0;
   setGps('on', 'SIM driving');
   const tick = () => {
     const a = route[i], b = route[Math.min(i + 1, route.length - 1)];
+    const segMi = Math.max(haversineMi(a, b), 0.1);
+    const step = Math.min(0.9 / segMi, 1);   // advance ~0.9 miles along this leg
     const lat = a.lat + (b.lat - a.lat) * f;
     const lng = a.lng + (b.lng - a.lng) * f;
     onPosition({ latitude: lat, longitude: lng, heading: bearing(a, b), speed: 29 }); // ~65mph
-    f += 0.34;
+    f += step;
     if (f >= 1) { f = 0; i++; }
     if (i >= route.length - 1) { clearInterval(state.simTimer); state.simTimer = null; }
   };
   tick();
-  state.simTimer = setInterval(tick, 4000);
+  state.simTimer = setInterval(tick, 10000);
 }
 
 // Numeric tuners rendered as tap steppers (no sliders to drag while scrolling).
@@ -1410,6 +1553,17 @@ function bindSettings() {
       saveSettings();
     });
   }
+
+  // Navigation app (Auto / Apple Maps / Google Maps / Waze)
+  const navAppEl = $('#nav-app');
+  if (navAppEl) {
+    navAppEl.value = settings.navApp || 'auto';
+    navAppEl.addEventListener('change', () => {
+      settings.navApp = navAppEl.value;
+      saveSettings();
+    });
+  }
+
   buildSteppers();
   // Re-run search when filters that affect ranking change & we have a fix.
   ['#ahead-only'].forEach(sel =>
@@ -1527,6 +1681,7 @@ function buildCuisineChips() {
       const i = settings.cuisines.indexOf(type);
       if (i >= 0) settings.cuisines.splice(i, 1); else settings.cuisines.push(type);
       btn.classList.toggle('active');
+      clearPlacesCache();
       saveSettings();
       if (state.pos && settings.categories.includes('food')) search();
     });
@@ -1666,10 +1821,20 @@ function init() {
   $('#detail').addEventListener('click', e => { if (e.target.id === 'detail') closeDetail(); });
   $('#sim-btn').addEventListener('click', () => { els.settings.classList.add('hidden'); startSim(); });
 
+  // Re-acquire Screen Wake Lock when switching back to tab/app while driving
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && state.running) {
+      acquireWakeLock();
+    }
+  });
+
   if (!effectiveKey()) showEmpty('Welcome to Hino’s RoadBite\n\nTap ⚙︎ to add your Google Places API key, then "Start driving".', '🚗');
   else showEmpty('Tap "Start driving" to find food, coffee, gas & EV charging ahead of you.', '🍔☕');
 
-  if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
+  if ('serviceWorker' in navigator) {
+    const swUrl = location.pathname.includes('/warm') ? '../sw.js' : 'sw.js';
+    navigator.serviceWorker.register(swUrl).catch(() => {});
+  }
 }
 
 document.addEventListener('DOMContentLoaded', init);
@@ -1679,4 +1844,5 @@ window.RoadBite = {
   state, settings, onPosition, search, startSim, render, renderQuickDest, sortResults,
   updateHeadingBanner, toast, rankPlace, planSearchCenters, corridorStops, addedDetourMinutes,
   applyDetourMinutes, visibleResults, skipStop, detourPhrase,
+  acquireWakeLock, releaseWakeLock, clearPlacesCache, expirePlacesCache, navigateTo,
 };
